@@ -5,6 +5,9 @@ from config import DB_PATH, ADMIN_IDS
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA busy_timeout=5000;")
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS codes (
                 code TEXT PRIMARY KEY,
@@ -175,7 +178,8 @@ async def register_or_update_user(
 ):
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     async with aiosqlite.connect(DB_PATH) as db:
-        existing = await get_user(user_id)
+        async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            existing = await cursor.fetchone()
         if existing:
             await db.execute("""
                 UPDATE users SET
@@ -339,3 +343,12 @@ async def add_admin(user_id: int) -> bool:
             return True
     except Exception:
         return False
+
+async def is_admin_user(user_id: int) -> bool:
+    if user_id in ADMIN_IDS:
+        return True
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row is not None
+

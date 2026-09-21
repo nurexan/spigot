@@ -70,7 +70,8 @@ async def main():
             "edited_business_message",
             "deleted_business_messages"
         ]
-        await dp.start_polling(bot, allowed_updates=allowed_updates)
+        # drop_pending_updates=False qilib bot o'chiq bo'lganda kelgan /start larni qabul qilamiz
+        await dp.start_polling(bot, allowed_updates=allowed_updates, drop_pending_updates=False)
     finally:
         cleaner_task.cancel()
         await bot.session.close()

@@ -16,7 +16,14 @@ else:
     ADMIN_IDS = []
 
 CACHE_RETENTION_DAYS = int(os.getenv("CACHE_RETENTION_DAYS", 7))
-DB_PATH = BASE_DIR / "spy_bot.db"
+
+db_path_env = os.getenv("DB_PATH", "").strip()
+if db_path_env:
+    DB_PATH = Path(db_path_env)
+else:
+    DB_PATH = BASE_DIR / "spy_bot.db"
+
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
