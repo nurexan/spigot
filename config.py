@@ -6,14 +6,14 @@ BASE_DIR = Path(__file__).resolve().parent
 
 load_dotenv(BASE_DIR / ".env")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip() or "8751576357:AAHVuGYC8Ua3WnSKeRKI64oXRe7o6mM0_Ck"
 
 # Admin IDs list
 admin_ids_raw = os.getenv("ADMIN_IDS", "").strip()
 if admin_ids_raw:
     ADMIN_IDS = [int(x.strip()) for x in admin_ids_raw.split(",") if x.strip().isdigit()]
 else:
-    ADMIN_IDS = []
+    ADMIN_IDS = [7832781255]
 
 CACHE_RETENTION_DAYS = int(os.getenv("CACHE_RETENTION_DAYS", 7))
 
