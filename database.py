@@ -60,6 +60,11 @@ async def init_db():
             )
         """)
 
+        # Indekslar - tezkor qidiruv uchun
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_cached_msgs ON cached_messages (business_connection_id, chat_id, message_id);")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_users_conn ON users (business_connection_id);")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_codes_active ON codes (is_used, code_type);")
+
         # Add initial config admins if not already present
         for admin_id in ADMIN_IDS:
             await db.execute(
@@ -174,13 +179,15 @@ async def register_or_update_user(
     business_connection_id: Optional[str] = None,
     code_used: Optional[str] = None,
     tracking_type: str = "normal",
-    is_active: int = 1
+    is_active: Optional[int] = None
 ):
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        async with db.execute("SELECT user_id, is_active FROM users WHERE user_id = ?", (user_id,)) as cursor:
             existing = await cursor.fetchone()
         if existing:
+            # Agar is_active aniq berilmagan bo'lsa, mavjud qiymatni saqlab qolamiz
+            actual_active = existing[1] if is_active is None else is_active
             await db.execute("""
                 UPDATE users SET
                     first_name = COALESCE(?, first_name),
@@ -194,9 +201,10 @@ async def register_or_update_user(
                 WHERE user_id = ?
             """, (
                 first_name, last_name, username, business_connection_id,
-                code_used, tracking_type, is_active, now, user_id
+                code_used, tracking_type, actual_active, now, user_id
             ))
         else:
+            actual_active = 0 if is_active is None else is_active
             await db.execute("""
                 INSERT INTO users (
                     user_id, first_name, last_name, username,
@@ -206,7 +214,7 @@ async def register_or_update_user(
             """, (
                 user_id, first_name, last_name, username,
                 business_connection_id, code_used, tracking_type,
-                is_active, now, now
+                actual_active, now, now
             ))
         await db.commit()
 
@@ -295,6 +303,7 @@ async def get_cached_message(
 ) -> Optional[Dict[str, Any]]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
+        # 1. Avval aniq connection_id bilan qidiramiz
         async with db.execute("""
             SELECT * FROM cached_messages
             WHERE business_connection_id = ? AND chat_id = ? AND message_id = ?
@@ -303,7 +312,29 @@ async def get_cached_message(
             row = await cursor.fetchone()
             if row:
                 return dict(row)
+
+        # 2. Agar connection_id o'zgargan bo'lsa, chat_id va message_id bo'yicha qidiramiz
+        async with db.execute("""
+            SELECT * FROM cached_messages
+            WHERE chat_id = ? AND message_id = ?
+            ORDER BY id DESC LIMIT 1
+        """, (chat_id, message_id)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return dict(row)
     return None
+
+async def delete_cached_message(chat_id: int, message_id: int):
+    """Xabar Telegramga uzatilgandan so'ng server keshidan darhol o'chirish (server xotirasini tejash uchun)"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "DELETE FROM cached_messages WHERE chat_id = ? AND message_id = ?",
+                (chat_id, message_id)
+            )
+            await db.commit()
+    except Exception as e:
+        print(f"Error deleting cached message: {e}")
 
 async def update_cached_message_text(
     business_connection_id: str,
@@ -314,15 +345,27 @@ async def update_cached_message_text(
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             UPDATE cached_messages SET text = ?
-            WHERE business_connection_id = ? AND chat_id = ? AND message_id = ?
+            WHERE (business_connection_id = ? OR chat_id = ?) AND message_id = ?
         """, (new_text, business_connection_id, chat_id, message_id))
         await db.commit()
 
-async def clean_old_messages(days: int = 7):
-    async with aiosqlite.connect(DB_PATH) as db:
-        threshold = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-        await db.execute("DELETE FROM cached_messages WHERE created_at < ?", (threshold,))
-        await db.commit()
+async def clean_old_messages(hours: int = 24):
+    """24 soatdan oshgan eski xabarlarni tozalash va bazani ixchamlashtirish"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            threshold = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+            await db.execute("DELETE FROM cached_messages WHERE created_at < ?", (threshold,))
+            await db.commit()
+    except Exception as e:
+        print(f"Error cleaning old messages: {e}")
+
+async def vacuum_db():
+    """Bo'shatilgan joyni operatsion tizimga qaytarish uchun bazani optimallashtirish"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("VACUUM;")
+    except Exception as e:
+        print(f"Error running VACUUM: {e}")
 
 # --- Admin Operations ---
 
@@ -339,6 +382,15 @@ async def add_admin(user_id: int) -> bool:
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,))
+            await db.commit()
+            return True
+    except Exception:
+        return False
+
+async def remove_admin(user_id: int) -> bool:
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
             await db.commit()
             return True
     except Exception:

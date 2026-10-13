@@ -55,7 +55,8 @@ async def handle_create_normal_code(message: Message):
             f"🔑 <b>Kod:</b> <code>{code}</code>\n"
             f"🔹 <b>Turi:</b> Oddiy kuzatuv\n"
             f"🔗 <b>To'g'ridan-to'g'ri havola:</b> {link}\n\n"
-            f"📌 <i>Foydalanuvchiga ushbu kodni yoki havolani yuboring. U botga kirib Telegram Business orqali botni ulaydi.</i>"
+            f"📌 <i>Foydalanuvchiga ushbu kodni yoki havolani yuboring. U botga kirib Telegram Business orqali botni ulaydi.</i>\n\n"
+            f"💡 <b>Eslatma:</b> Foydalanuvchi botni ulayotganda «Chatlar» bo'limida <b>«Barcha chatlar»</b> ni tanlashi zarur."
         )
         await message.answer(text, parse_mode="HTML")
     else:
@@ -77,7 +78,8 @@ async def handle_create_special_code(message: Message):
             f"🔑 <b>Kod:</b> <code>{code}</code>\n"
             f"🚨 <b>Turi:</b> Maxsus kuzatuv\n"
             f"🔗 <b>Havola:</b> {link}\n\n"
-            f"📌 <i>Ushbu kod orqali ulangan foydalanuvchining barcha xabarlari «🚨 MAXSUS KUZATUV:» belgisi bilan adminga keladi.</i>"
+            f"📌 <i>Ushbu kod orqali ulangan foydalanuvchining barcha yozishmalari «🚨 MAXSUS KUZATUV:» belgisi bilan adminga keladi.</i>\n\n"
+            f"💡 <b>Eslatma:</b> Barcha suhbatlar to'liq kelishi uchun foydalanuvchi Telegram Business Chatbots sozlamalarida <b>«Barcha chatlar» (Все чаты)</b> ni tanlashi shart."
         )
         await message.answer(text, parse_mode="HTML")
     else:
@@ -357,3 +359,15 @@ async def cmd_add_admin(message: Message):
     new_admin_id = int(args[1])
     await db.add_admin(new_admin_id)
     await message.answer(f"✅ Yangi admin qo'shildi: <code>{new_admin_id}</code>", parse_mode="HTML")
+
+# Adminni o'chirish buyrug'i: /deladmin <user_id>
+@admin_router.message(IsAdminFilter(), Command("deladmin"))
+async def cmd_del_admin(message: Message):
+    args = message.text.split()
+    if len(args) < 2 or not args[1].isdigit():
+        await message.answer("⚠️ Foydalanish: <code>/deladmin &lt;Telegram_ID&gt;</code>", parse_mode="HTML")
+        return
+
+    del_id = int(args[1])
+    await db.remove_admin(del_id)
+    await message.answer(f"✅ Admin o'chirildi: <code>{del_id}</code>", parse_mode="HTML")

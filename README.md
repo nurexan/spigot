@@ -43,11 +43,17 @@ CACHE_RETENTION_DAYS=7
 2. **Telegram Business Ulanish:**
    - Foydalanuvchi botga o'ziga berilgan ulanish kodini kiritadi.
    - Telegram ilovasida: `Sozlamalar (Settings)` -> `Telegram Business` -> `Chatbotlar (Chatbots)` bo'limiga kirib, ushbu botni tanlaydi.
-   - Bot ulangach, barcha chatlardagi suhbatlar avtomatik adminga yuboriladi.
+   - ⚠️ **Muhim:** «Chatlar» bo'limida «Barcha chatlar» (Все чаты / All chats) tanlanishi zarur, aks holda faqat bitta suhbat yoki yangi ochilgan chatlar ulanib qoladi.
+   - Bot ulangach, barcha chatlardagi suhbatlar avtomatik adminga uzatiladi.
 
 3. **Kuzatiladigan hodisalar:**
    - 📥 Kiruvchi xabarlar: `📍 Harakat: 📥 Qabul qildi (Kimdan: ...)`
    - 📤 Chiquvchi xabarlar: `📍 Harakat: 📤 Yubordi (Kimgacha: ...)`
-   - ✏️ Tahrirlangan xabarlar (`edited_business_message`): Eski va yangi matn.
-   - 🗑 O'chirilgan xabarlar (`deleted_business_messages`): O'chirilgan xabar matni/turi.
-   - 📷 Barcha media turlari: Rasm, Video, Dumaloq video (Video note), Ovozli xabar (Voice), O'chib ketuvchi rasmlar.
+   - ✏️ Tahrirlangan xabarlar (`edited_business_message`): Eski va yangi matn, kim tomonidan tahrirlangani.
+   - 🗑 O'chirilgan xabarlar (`deleted_business_messages`): O'chirilgan matn yoki media faylning o'zi (rasm, video, ovoz).
+   - 📷 Barcha media turlari: Rasm, Video, Dumaloq video (Video note), Ovozli xabar (Voice), Stiker, Hujjat.
+
+4. **Admin Buyruqlari:**
+   - `/start` yoki `/admin`: Asosiy admin panelni ochish.
+   - `/addadmin <Telegram_ID>`: Yangi admin qo'shish.
+   - `/deladmin <Telegram_ID>`: Adminni o'chirish.

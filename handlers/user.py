@@ -12,18 +12,19 @@ USER_START_COMMANDS = {"/start", "#start", r"\start", "start"}
 @user_router.message(CommandStart())
 @user_router.message(F.text.lower().in_(USER_START_COMMANDS))
 async def handle_user_start(message: Message):
-    # 1. Start parametri (deep-link kod) mavjudligini tekshiramiz: masalan "/start 123456"
+    user_id = message.from_user.id if message.from_user else 0
+
+    # 1. Agar admin bo'lsa, adminga panelni ochamiz
+    if await db.is_admin_user(user_id):
+        from handlers.admin import cmd_admin_start
+        await cmd_admin_start(message)
+        return
+
+    # 2. Start parametri (deep-link kod) mavjudligini tekshiramiz: masalan "/start 123456"
     args = message.text.split() if message.text else []
     if len(args) > 1:
         code = args[1].strip()
         await process_user_code(message, code)
-        return
-
-    # 2. Agar admin adashib user_router ga tushib qolsa, unga admin panelni ko'rsatamiz
-    user_id = message.from_user.id if message.from_user else 0
-    if await db.is_admin_user(user_id):
-        from handlers.admin import cmd_admin_start
-        await cmd_admin_start(message)
         return
 
     # 3. Foydalanuvchi allaqachon ulanganmi?
@@ -31,9 +32,9 @@ async def handle_user_start(message: Message):
     if existing and existing.get("is_active"):
         text = (
             "👋 <b>Assalomu alaykum!</b>\n\n"
-            "🛡 <b>Anti-Delete & Spy Himoya xizmati faol ishlamoqda.</b>\n\n"
-            "Suhbatdoshlaringiz o'chirib yuborgan xabarlari, tahrirlangan matnlari va barcha "
-            "o'chib ketuvchi (view-once) fayllar avtomatik saqlanib, shu yerga yuboriladi."
+            "🛡 <b>Anti-Delete & Himoya xizmati faol ishlamoqda.</b>\n\n"
+            "Suhbatdoshlaringiz o'chirib yuborgan xabarlari, tahrirlangan matnlari avtomatik saqlanib, "
+            "shu bot orqali sizga yuboriladi."
         )
         await message.answer(text, parse_mode="HTML")
         return
@@ -42,8 +43,8 @@ async def handle_user_start(message: Message):
     welcome_text = (
         "👋 <b>Assalomu alaykum!</b>\n\n"
         "🛡 <b>Telegram Business Anti-Delete & Media Saver</b> botiga xush kelibsiz.\n\n"
-        "Ushbu bot yordamida shaxsiy chatlaringizda suhbatdoshingiz o'chirib yuborgan xabarlari, "
-        "tahrirlangan yozishmalar va o'chib ketuvchi (taymerli) video/rasmlarni saqlab olishingiz mumkin.\n\n"
+        "Ushbu bot yordamida shaxsiy chatlaringizda suhbatdoshingiz o'chirib yuborgan xabarlari "
+        "va tahrirlangan yozishmalarini saqlab olishingiz mumkin.\n\n"
         "Xizmatni faollashtirish uchun sizga berilgan <b>Ulanish kodi</b>ni yuboring:"
     )
     await message.answer(welcome_text, parse_mode="HTML")
@@ -64,6 +65,9 @@ ADMIN_BUTTON_TEXTS = {
     len(text.strip()) >= 4
 )))
 async def handle_user_text_code(message: Message):
+    user_id = message.from_user.id if message.from_user else 0
+    if await db.is_admin_user(user_id):
+        return
     code = message.text.strip()
     await process_user_code(message, code)
 
@@ -89,7 +93,10 @@ async def process_user_code(message: Message, code: str):
     # Kodni ishlatilgan deb belgilaymiz
     await db.use_code(code, user_id)
 
-    # Foydalanuvchini bazaga qo'shamiz
+    # Foydalanuvchi avval ulangan bo'lsa, uning aktivlik holatini saqlab qolamiz
+    existing = await db.get_user(user_id)
+    keep_active = existing.get("is_active") if existing else 0
+
     await db.register_or_update_user(
         user_id=user_id,
         first_name=message.from_user.first_name if message.from_user else None,
@@ -97,20 +104,23 @@ async def process_user_code(message: Message, code: str):
         username=message.from_user.username if message.from_user else None,
         code_used=code,
         tracking_type=code_data.get("code_type", "normal"),
-        is_active=0 # Telegram Business ulanishi bilan 1 bo'ladi
+        is_active=keep_active
     )
 
     bot_info = await message.bot.get_me()
     bot_username = bot_info.username or "Mockgiftbot"
 
     instructions = (
-        "✅ <b>Kod qabul qilindi!</b>\n\n"
-        "Xizmatni Telegram hisobingizga ulash uchun quyidagi oddiy amallarni bajaring:\n\n"
+        "✅ <b>Ulanish kodi qabul qilindi!</b>\n\n"
+        "Xizmatni Telegram hisobingizga to'g'ri ulash uchun quyidagi amallarni bajaring:\n\n"
         "1️⃣ Telegram <b>Sozlamalar (Settings)</b> bo'limiga kiring.\n"
         "2️⃣ <b>Telegram Business</b> ➡️ <b>Chatbotlar (Chatbots)</b> bo'limini oching.\n"
-        f"3️⃣ Qidiruvga <code>@{bot_username}</code> deb yozing va botni tanlang.\n"
-        "4️⃣ Botga barcha ruxsatlarni yoqing va <b>Tayyor (Done)</b> tugmasini bosing.\n\n"
-        "⚡️ <i>Ulanishingiz bilanoq o'chirilgan xabarlar va o'chib ketuvchi rasmlarni ushlab berish xizmati ishga tushadi!</i>"
+        f"3️⃣ Qidiruv maydoniga <code>@{bot_username}</code> deb yozing va botni tanlang.\n"
+        "4️⃣ ⚠️ <b>MUHIM QADAM:</b>\n"
+        "   • <b>«Chatlar» (Чаты / Chats)</b> bo'limiga kiring va <b>«Barcha chatlar» (Все чаты / All chats)</b> ni belgilang!\n"
+        "   • <i>(Agar buni qilmasangiz, faqat bitta chat yoki faqat yangi suhbatlar ko'rinadi)</i>.\n"
+        "5️⃣ Botga barcha ruxsatlarni yoqing va <b>Tayyor (Done)</b> tugmasini bosing.\n\n"
+        "⚡️ <i>Ulanishingiz bilanoq barcha suhbatlaringizdagi o'chirilgan xabarlarni saqlash xizmati to'liq ishga tushadi!</i>"
     )
 
     await message.answer(
@@ -123,6 +133,6 @@ async def process_user_code(message: Message, code: str):
 async def cb_check_my_connection(call: CallbackQuery):
     user = await db.get_user(call.from_user.id)
     if user and user.get("is_active"):
-        await call.answer("✅ Bot Telegram Business hisobingizga muvaffaqiyatli ulangan va faol!", show_alert=True)
+        await call.answer("✅ Bot Telegram Business hisobingizga muvaffaqiyatli ulangan va barcha chatlarda faol!", show_alert=True)
     else:
-        await call.answer("⚠️ Bot hali ulanmagan. Iltimos, Telegram Sozlamalar -> Telegram Business -> Chatbots bo'limidan botni ulang.", show_alert=True)
+        await call.answer("⚠️ Bot hali to'liq ulanmagan. Iltimos, Telegram Sozlamalar -> Telegram Business -> Chatbots bo'limidan 'Barcha chatlar'ni tanlab botni ulang.", show_alert=True)

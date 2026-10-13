@@ -47,12 +47,13 @@ async def start_healthcheck_server():
         return None
 
 async def background_cache_cleaner():
-    """Eski kesh xabarlarini har 24 soatda tozalash"""
+    """Eski kesh xabarlarini har 1 soatda tozalash va bazani ixchamlashtirish (24 soatdan oshgan xabarlar o'chiriladi)"""
     while True:
         try:
-            await asyncio.sleep(86400) # 24 soat
-            await db.clean_old_messages(days=7)
-            logger.info("Message cache cleanup completed.")
+            await asyncio.sleep(3600) # 1 soat
+            await db.clean_old_messages(hours=24)
+            await db.vacuum_db()
+            logger.info("Message cache cleanup and vacuum completed.")
         except asyncio.CancelledError:
             break
         except Exception as e:
