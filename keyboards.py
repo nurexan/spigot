@@ -42,15 +42,22 @@ def get_users_list_ikb(users: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
     buttons.append([InlineKeyboardButton(text="🔄 Yangilash", callback_data="refresh_users")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_user_detail_ikb(user_id: int, is_active: bool) -> InlineKeyboardMarkup:
+def get_user_detail_ikb(user_id: int, is_active: bool, tracking_type: str = "special") -> InlineKeyboardMarkup:
     """Foydalanuvchi boshqaruv paneli"""
     status_btn = (
         InlineKeyboardButton(text="🔴 O'chirish (Nofaol qilish)", callback_data=f"toggle_user_{user_id}_0")
         if is_active else
         InlineKeyboardButton(text="🟢 Faollashtirish", callback_data=f"toggle_user_{user_id}_1")
     )
+    is_sp = (tracking_type == "special")
+    mode_btn = (
+        InlineKeyboardButton(text="🔹 Oddiy Kuzatuvga o'tkazish", callback_data=f"set_mode_{user_id}_normal")
+        if is_sp else
+        InlineKeyboardButton(text="🚨 Maxsus Kuzatuvga o'tkazish", callback_data=f"set_mode_{user_id}_special")
+    )
     buttons = [
         [status_btn],
+        [mode_btn],
         [InlineKeyboardButton(text="🗑 Foydalanuvchini bazadan o'chirish", callback_data=f"delete_user_{user_id}")],
         [InlineKeyboardButton(text="⬅️ Ortga", callback_data="back_to_users")]
     ]

@@ -163,7 +163,7 @@ async def cb_user_view(call: CallbackQuery):
     await call.message.edit_text(
         text,
         parse_mode="HTML",
-        reply_markup=kb.get_user_detail_ikb(user_id, bool(user.get("is_active")))
+        reply_markup=kb.get_user_detail_ikb(user_id, bool(user.get("is_active")), user.get("tracking_type") or "special")
     )
     await call.answer()
 
@@ -202,7 +202,46 @@ async def cb_toggle_user(call: CallbackQuery):
         await call.message.edit_text(
             text,
             parse_mode="HTML",
-            reply_markup=kb.get_user_detail_ikb(user_id, bool(user.get("is_active")))
+            reply_markup=kb.get_user_detail_ikb(user_id, bool(user.get("is_active")), user.get("tracking_type") or "special")
+        )
+
+# Foydalanuvchi kuzatuv rejimini o'zgartirish (Maxsus / Oddiy)
+@admin_router.callback_query(IsAdminFilter(), F.data.startswith("set_mode_"))
+async def cb_set_user_mode(call: CallbackQuery):
+    parts = call.data.split("_")
+    user_id = int(parts[2])
+    new_mode = parts[3]
+
+    await db.set_user_tracking_type(user_id, new_mode)
+    label = "🚨 Maxsus Kuzatuv" if new_mode == "special" else "🔹 Oddiy Kuzatuv"
+    await call.answer(f"Rejim o'zgartirildi: {label}!")
+
+    user = await db.get_user(user_id)
+    if user:
+        status_str = "🟢 Faol (Telegram Business ulangan)" if user.get("is_active") else "🔴 Nofaol (O'chirilgan)"
+        mode_str = "🚨 Maxsus Kuzatuv" if user.get("tracking_type") == "special" else "🔹 Oddiy Kuzatuv"
+        code_used = user.get("code_used") or "Nomalum"
+        conn_time = user.get("connected_at") or "Nomalum"
+        last_act = user.get("last_activity") or "Nomalum"
+        first_name = html.escape(user.get("first_name") or "")
+        last_name = html.escape(user.get("last_name") or "")
+
+        text = (
+            f"👤 <b>Foydalanuvchi ma'lumotlari:</b>\n\n"
+            f"• <b>Ism:</b> {first_name} {last_name}\n"
+            f"• <b>Username:</b> @{html.escape(user.get('username') or 'mavjud_emas')}\n"
+            f"• <b>ID:</b> <code>{user.get('user_id')}</code>\n"
+            f"• <b>Holat:</b> {status_str}\n"
+            f"• <b>Rejim:</b> {mode_str}\n"
+            f"• <b>Ishlatgan kodi:</b> <code>{html.escape(code_used)}</code>\n"
+            f"• <b>Ulanish vaqti:</b> {conn_time}\n"
+            f"• <b>Oxirgi faollik:</b> {last_act}\n"
+            f"• <b>Uzatilgan xabarlar soni:</b> {user.get('total_messages', 0)} ta\n"
+        )
+        await call.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=kb.get_user_detail_ikb(user_id, bool(user.get("is_active")), user.get("tracking_type") or "special")
         )
 
 # Foydalanuvchini o'chirish

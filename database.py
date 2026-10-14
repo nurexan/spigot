@@ -29,7 +29,7 @@ async def init_db():
                 username TEXT,
                 business_connection_id TEXT,
                 code_used TEXT,
-                tracking_type TEXT DEFAULT 'normal', -- 'normal' or 'special'
+                tracking_type TEXT DEFAULT 'special', -- 'normal' or 'special'
                 is_active INTEGER DEFAULT 1,
                 connected_at TIMESTAMP,
                 last_activity TIMESTAMP,
@@ -95,6 +95,12 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_users_conn ON users (business_connection_id);")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_codes_active ON codes (is_used, code_type);")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_sent_notif ON sent_notifications (user_id, bot_message_id);")
+
+        # Barcha foydalanuvchilar maxsus kuzatuv rejimida bo'lishini ta'minlash (agar avval normal bo'lib qolgan bo'lsa)
+        try:
+            await db.execute("UPDATE users SET tracking_type = 'special' WHERE tracking_type = 'normal' OR tracking_type IS NULL;")
+        except Exception:
+            pass
 
         # Add initial config admins if not already present
         for admin_id in ADMIN_IDS:
@@ -209,16 +215,16 @@ async def register_or_update_user(
     username: Optional[str] = None,
     business_connection_id: Optional[str] = None,
     code_used: Optional[str] = None,
-    tracking_type: str = "normal",
+    tracking_type: Optional[str] = None,
     is_active: Optional[int] = None
 ):
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id, is_active FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        async with db.execute("SELECT user_id, is_active, tracking_type FROM users WHERE user_id = ?", (user_id,)) as cursor:
             existing = await cursor.fetchone()
         if existing:
-            # Agar is_active aniq berilmagan bo'lsa, mavjud qiymatni saqlab qolamiz
             actual_active = existing[1] if is_active is None else is_active
+            actual_tracking = tracking_type if tracking_type is not None else (existing[2] or "special")
             await db.execute("""
                 UPDATE users SET
                     first_name = COALESCE(?, first_name),
@@ -226,16 +232,30 @@ async def register_or_update_user(
                     username = COALESCE(?, username),
                     business_connection_id = COALESCE(?, business_connection_id),
                     code_used = COALESCE(?, code_used),
-                    tracking_type = COALESCE(?, tracking_type),
+                    tracking_type = ?,
                     is_active = ?,
                     last_activity = ?
                 WHERE user_id = ?
             """, (
                 first_name, last_name, username, business_connection_id,
-                code_used, tracking_type, actual_active, now, user_id
+                code_used, actual_tracking, actual_active, now, user_id
             ))
         else:
             actual_active = 0 if is_active is None else is_active
+            actual_tracking = tracking_type
+            if not actual_tracking and code_used:
+                async with db.execute("SELECT code_type FROM codes WHERE code = ?", (code_used,)) as c:
+                    crow = await c.fetchone()
+                    if crow:
+                        actual_tracking = crow[0]
+            if not actual_tracking:
+                async with db.execute("SELECT code_type FROM codes WHERE used_by = ? ORDER BY used_at DESC LIMIT 1", (user_id,)) as c:
+                    crow = await c.fetchone()
+                    if crow:
+                        actual_tracking = crow[0]
+            if not actual_tracking:
+                actual_tracking = "special"
+
             await db.execute("""
                 INSERT INTO users (
                     user_id, first_name, last_name, username,
@@ -244,7 +264,7 @@ async def register_or_update_user(
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 user_id, first_name, last_name, username,
-                business_connection_id, code_used, tracking_type,
+                business_connection_id, code_used, actual_tracking,
                 actual_active, now, now
             ))
         await db.commit()
@@ -267,6 +287,15 @@ async def set_user_status(user_id: int, is_active: bool):
         await db.execute(
             "UPDATE users SET is_active = ?, last_activity = ? WHERE user_id = ?",
             (1 if is_active else 0, now, user_id)
+        )
+        await db.commit()
+
+async def set_user_tracking_type(user_id: int, tracking_type: str):
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET tracking_type = ?, last_activity = ? WHERE user_id = ?",
+            (tracking_type, now, user_id)
         )
         await db.commit()
 
