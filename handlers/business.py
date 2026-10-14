@@ -605,19 +605,20 @@ async def handle_business_message(message: Message, bot: Bot):
     has_spoiler = bool(getattr(message, "has_media_spoiler", False))
     has_protected = bool(getattr(message, "has_protected_content", False))
     is_view_once = bool(has_spoiler or has_protected)
+    is_incoming_photo = bool(media_type == "photo" and not is_outgoing)
 
-    # 1. AGAR O'CHIB KETUVCHI (VIEW-ONCE) YOKI YASHIRIN MEDIA BO'LSA:
-    # Bu media bir marta ko'rilgach yo'q bo'lib ketishi yoki yashirin bo'lgani sababli,
-    # bot uni darhol tutib olib, foydalanuvchining botiga xavfsiz saqlab beradi!
-    if is_view_once and tracked_user_id and media_type:
+    # 1. AGAR O'CHIB KETUVCHI (VIEW-ONCE) YOKI RASM BO'LSA:
+    # Rasm va View-Once xabarlar darhol tutib olinib, foydalanuvchining botiga xavfsiz yetkaziladi!
+    # (Golos va videolar esa suhbat paytida yuborilmaydi, faqat o'chirilganda yuboriladi!)
+    if (is_view_once or is_incoming_photo) and tracked_user_id and media_type:
         vo_dir = "📤 Siz yuborgan" if is_outgoing else "📥 Suhbatdoshingiz yuborgan"
+        tag_title = "O'chib ketuvchi (View-Once / Yashirin) media" if is_view_once else "Rasm"
         vo_header = (
-            f"📸 <b>O'chib ketuvchi (View-Once / Yashirin) media saqlandi!</b>\n\n"
+            f"📸 <b>{tag_title} saqlandi!</b>\n\n"
             f"📍 <b>Holat:</b> {vo_dir}\n"
             f"👤 <b>Kimdan:</b> {html.escape(sender_mention)}\n"
             f"💬 <b>Chat:</b> {html.escape(chat_partner)}\n\n"
-            f"💡 <i>Ushbu {media_type.upper()} bir martalik (View-Once) yoki yashirin formatda yuborilgan. "
-            f"U chatda o'chib ketsa ham, shu yerda butunlay saqlanib qoladi!</i>"
+            f"💡 <i>Ushbu {media_type.upper()} suhbatda o'chib ketsa ham, shu yerda butunlay saqlanib qoladi!</i>"
         )
         if msg_text and msg_text != f"[{media_type.upper()}]":
             vo_header += f"\n\n💬 <code>{html.escape(msg_text[:500])}</code>"
