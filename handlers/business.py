@@ -1,14 +1,20 @@
 import html
 import logging
+import os
+import asyncio
 from typing import Optional
 from aiogram import Router, Bot
 from aiogram.types import (
     BusinessConnection,
     Message,
-    BusinessMessagesDeleted
+    BusinessMessagesDeleted,
+    FSInputFile,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton
 )
 
 import database as db
+from config import MEDIA_CACHE_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +109,257 @@ async def broadcast_to_admins(bot: Bot, text: str, reply_markup=None):
     admin_ids = await db.get_all_admin_ids()
     for admin_id in admin_ids:
         await send_to_admin_safely(bot, admin_id, text, reply_markup)
+
+async def download_media_file(
+    bot: Bot,
+    file_id: str,
+    file_ext: str,
+    chat_id: int,
+    message_id: int
+) -> Optional[str]:
+    """
+    Media faylni (rasm, video, golos, dumaloq video, va h.k.) darhol server diskiga yuklab olish.
+    Bu o'chib ketuvchi (view-once/self-destructing) xabarlar o'chib ketganda ham fayl yo'qolib qolmasligini kafolatlaydi.
+    """
+    try:
+        tg_file = await asyncio.wait_for(bot.get_file(file_id), timeout=25)
+        if not tg_file.file_path:
+            return None
+        ext = file_ext
+        if not ext and "." in tg_file.file_path:
+            ext = "." + tg_file.file_path.split(".")[-1]
+        if not ext:
+            ext = ".bin"
+
+        dest_filename = f"{chat_id}_{message_id}{ext}"
+        dest_path = MEDIA_CACHE_DIR / dest_filename
+        await asyncio.wait_for(bot.download_file(tg_file.file_path, dest_path), timeout=25)
+        if dest_path.exists() and dest_path.stat().st_size > 0:
+            return str(dest_path)
+    except Exception as e:
+        logger.warning(f"Media faylni saqlashda ogohlantirish ({file_id}): {e}")
+    return None
+
+async def send_saved_media(
+    bot: Bot,
+    chat_id: int,
+    media_type: Optional[str],
+    file_id: Optional[str],
+    local_file_path: Optional[str],
+    caption: str,
+    reply_markup=None,
+    as_document: bool = False
+) -> Optional[Message]:
+    """
+    Saqlangan media faylni xavfsiz jo'natish.
+    Avval diskdagi FSInputFile (asl fayl) ishlatiladi, agar u topilmasa Telegram file_id ishlatiladi.
+    """
+    has_local = bool(local_file_path and os.path.exists(local_file_path))
+    input_file = FSInputFile(local_file_path) if has_local else None
+
+    # Agar as_document bo'lsa (yuklab olish rejimida yoki original fayl ko'rinishida)
+    if as_document and (input_file or file_id):
+        try:
+            return await bot.send_document(
+                chat_id=chat_id,
+                document=input_file or file_id,
+                caption=safe_format_caption(caption),
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            logger.warning(f"Hujjat sifatida yuborishda xatolik: {e}")
+
+    try:
+        if media_type == "photo" and (input_file or file_id):
+            return await bot.send_photo(
+                chat_id=chat_id,
+                photo=input_file or file_id,
+                caption=safe_format_caption(caption),
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        elif media_type == "video" and (input_file or file_id):
+            return await bot.send_video(
+                chat_id=chat_id,
+                video=input_file or file_id,
+                caption=safe_format_caption(caption),
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        elif media_type == "animation" and (input_file or file_id):
+            return await bot.send_animation(
+                chat_id=chat_id,
+                animation=input_file or file_id,
+                caption=safe_format_caption(caption),
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        elif media_type == "voice" and (input_file or file_id):
+            return await bot.send_voice(
+                chat_id=chat_id,
+                voice=input_file or file_id,
+                caption=safe_format_caption(caption),
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        elif media_type == "video_note" and (input_file or file_id):
+            sent_txt = await bot.send_message(
+                chat_id=chat_id,
+                text=caption[:4096],
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+            try:
+                await bot.send_video_note(
+                    chat_id=chat_id,
+                    video_note=input_file or file_id
+                )
+            except Exception as e_vn:
+                logger.warning(f"Video note yuborishda ogohlantirish: {e_vn}")
+            return sent_txt
+        elif media_type == "document" and (input_file or file_id):
+            return await bot.send_document(
+                chat_id=chat_id,
+                document=input_file or file_id,
+                caption=safe_format_caption(caption),
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        elif media_type == "audio" and (input_file or file_id):
+            return await bot.send_audio(
+                chat_id=chat_id,
+                audio=input_file or file_id,
+                caption=safe_format_caption(caption),
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        elif media_type == "sticker" and file_id:
+            sent_txt = await bot.send_message(chat_id=chat_id, text=caption[:4096], parse_mode="HTML", reply_markup=reply_markup)
+            try:
+                await bot.send_sticker(chat_id=chat_id, sticker=file_id)
+            except Exception:
+                pass
+            return sent_txt
+        else:
+            return await bot.send_message(
+                chat_id=chat_id,
+                text=caption[:4096],
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+    except Exception as e:
+        logger.warning(f"send_saved_media da xatolik, oddiy matnga o'tildi: {e}")
+        try:
+            return await bot.send_message(
+                chat_id=chat_id,
+                text=caption[:4096],
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        except Exception:
+            return None
+
+async def handle_business_reply_download(
+    bot: Bot,
+    message: Message,
+    tracked_user_id: int,
+    conn_id: str,
+    chat_partner: str
+):
+    """
+    Foydalanuvchi biznes chatda biron xabarga reply qilganda (har qanday matn yozganda),
+    o'sha belgilangan xabarning media yoki matnini darhol foydalanuvchining botiga yuklab berish.
+    """
+    replied = message.reply_to_message
+    if not replied:
+        return
+
+    chat_id = message.chat.id
+    replied_id = replied.message_id
+
+    # 1. Keshdan qidiramiz
+    cached = await db.get_cached_message(conn_id, chat_id, replied_id)
+
+    media_type = None
+    file_id = None
+    local_path = None
+    file_ext = ""
+    msg_text = ""
+
+    if cached:
+        media_type = cached.get("media_type")
+        file_id = cached.get("file_id")
+        local_path = cached.get("local_file_path")
+        msg_text = cached.get("text") or cached.get("caption") or ""
+    else:
+        # Keshda bo'lmasa, replied_to_message obyektining o'zidan olamiz
+        if replied.photo:
+            media_type = "photo"
+            file_id = replied.photo[-1].file_id
+            file_ext = ".jpg"
+        elif replied.video:
+            media_type = "video"
+            file_id = replied.video.file_id
+            file_ext = ".mp4"
+        elif replied.voice:
+            media_type = "voice"
+            file_id = replied.voice.file_id
+            file_ext = ".ogg"
+        elif replied.video_note:
+            media_type = "video_note"
+            file_id = replied.video_note.file_id
+            file_ext = ".mp4"
+        elif replied.document:
+            media_type = "document"
+            file_id = replied.document.file_id
+            file_ext = ("." + replied.document.file_name.split(".")[-1]) if (replied.document.file_name and "." in replied.document.file_name) else ""
+        elif replied.audio:
+            media_type = "audio"
+            file_id = replied.audio.file_id
+            file_ext = ".mp3"
+        elif replied.animation:
+            media_type = "animation"
+            file_id = replied.animation.file_id
+            file_ext = ".mp4"
+        msg_text = replied.text or replied.caption or ""
+
+    # Agar diskda hali yuklanmagan bo'lsa va file_id bo'lsa, yuklab olamiz
+    if file_id and (not local_path or not os.path.exists(local_path)):
+        local_path = await download_media_file(bot, file_id, file_ext, chat_id, replied_id)
+        if local_path:
+            await db.update_cached_message_file(chat_id, replied_id, local_path)
+
+    # Foydalanuvchining botiga xabarni yetkazamiz
+    header = (
+        "📥 <b>Suhbatda reply qilingan xabar yuklab olindi!</b>\n\n"
+        f"💬 <b>Chat:</b> {html.escape(chat_partner)}\n"
+        f"✍️ <b>Sizning reply xabaringiz:</b> <i>{html.escape(message.text or '[Xabar]')}</i>\n"
+    )
+    if msg_text:
+        header += f"\n▫️ <b>Matn:</b> <code>{html.escape(msg_text[:1000])}</code>"
+
+    # Native media yuboramiz
+    await send_saved_media(
+        bot=bot,
+        chat_id=tracked_user_id,
+        media_type=media_type,
+        file_id=file_id,
+        local_file_path=local_path,
+        caption=header
+    )
+
+    # Fayl sifatida ham yuboramiz (to'liq saqlab olish uchun)
+    if media_type in {"photo", "video", "voice", "video_note"} and (local_path or file_id):
+        await send_saved_media(
+            bot=bot,
+            chat_id=tracked_user_id,
+            media_type=media_type,
+            file_id=file_id,
+            local_file_path=local_path,
+            caption="📁 <b>Asl fayl (Xotiraga/Galereyaga yuklab olish uchun):</b>",
+            as_document=True
+        )
 
 # ==========================================
 # 1. Telegram Business Ulanish / Uzilish (Connection)
@@ -212,41 +469,63 @@ async def handle_business_message(message: Message, bot: Bot):
     else:
         action_text = f"📥 Qabul qildi (Kimdan: {sender_mention})"
 
+    # 0. Agar foydalanuvchi biznes chatda biron xabarga reply qilsa (har qanday matn yozsa),
+    # o'sha belgilangan xabarning media yoki matnini darhol bot orqali yuklab beramiz
+    if is_outgoing and message.reply_to_message and tracked_user_id:
+        try:
+            await handle_business_reply_download(bot, message, tracked_user_id, conn_id, chat_partner)
+        except Exception as e:
+            logger.error(f"Error handling business reply download: {e}")
+
     # Xabarning matni yoki media tavsifi
     msg_text = message.text or message.caption or ""
     media_type = None
     file_id = None
+    file_ext = ""
 
     if message.photo:
         media_type = "photo"
         file_id = message.photo[-1].file_id
+        file_ext = ".jpg"
     elif message.video:
         media_type = "video"
         file_id = message.video.file_id
+        file_ext = ".mp4"
     elif message.animation:
         media_type = "animation"
         file_id = message.animation.file_id
+        file_ext = ".mp4"
     elif message.video_note:
         media_type = "video_note"
         file_id = message.video_note.file_id
+        file_ext = ".mp4"
     elif message.voice:
         media_type = "voice"
         file_id = message.voice.file_id
+        file_ext = ".ogg"
     elif message.audio:
         media_type = "audio"
         file_id = message.audio.file_id
+        file_ext = ".mp3"
     elif message.document:
         media_type = "document"
         file_id = message.document.file_id
+        file_ext = ("." + message.document.file_name.split(".")[-1]) if (message.document.file_name and "." in message.document.file_name) else ""
     elif message.sticker:
         media_type = "sticker"
         file_id = message.sticker.file_id
+        file_ext = ".webp"
     elif message.contact:
         msg_text = f"👤 Kontakt: {message.contact.first_name} ({message.contact.phone_number})"
     elif message.location:
         msg_text = f"📍 Joylashuv: {message.location.latitude}, {message.location.longitude}"
     elif message.poll:
         msg_text = f"📊 So'rovnoma: {message.poll.question}"
+
+    # Media faylni darhol mahalliy diskka yuklab olamiz (o'chib ketuvchi xabarlar uchun juda muhim!)
+    local_path = None
+    if file_id and media_type in {"photo", "video", "animation", "video_note", "voice", "audio", "document"}:
+        local_path = await download_media_file(bot, file_id, file_ext, message.chat.id, message.message_id)
 
     # Keshga saqlaymiz (Tahrirlash va o'chirishni aniqlash uchun)
     await db.save_cached_message(
@@ -259,7 +538,8 @@ async def handle_business_message(message: Message, bot: Bot):
         text=msg_text or (f"[{media_type.upper()}]" if media_type else "[Xabar]"),
         media_type=media_type,
         file_id=file_id,
-        caption=message.caption
+        caption=message.caption,
+        local_file_path=local_path
     )
 
     if tracked_user_id:
@@ -269,8 +549,14 @@ async def handle_business_message(message: Message, bot: Bot):
     # Bu spy bot fosh bo'lishini va loop/spam paydo bo'lishini oldini oladi.
     # Foydalanuvchiga faqat xabar o'chirilganda yoki tahrirlanganda yuboriladi.
 
+    # Faqat MAXSUS KUZATUV (special) kodi orqali ulangan foydalanuvchilarning oddiy xabarlari adminga yuboriladi.
+    # Oddiy kuzatuvda admin panelga har bir oddiy yozishma yuborilmaydi.
+    # Shuningdek, agar admin o'zi sinov o'tkazayotgan bo'lsa (admin_id == tracked_user_id), o'z xabarlari unga qaytib bormaydi.
+    if not is_special:
+        return
+
     # ADMINGA KUZATUV XABARINI YUBORISH
-    mode_tag = "🚨 <b>MAXSUS KUZATUV:</b>" if is_special else "🔹 <b>KUZATUV:</b>"
+    mode_tag = "🚨 <b>MAXSUS KUZATUV:</b>"
     user_header_info = f"👤 <b>Foydalanuvchi:</b> {html.escape(user_name)}"
     chat_info = f"💬 <b>Chat:</b> {html.escape(chat_partner)}"
     action_info = f"📍 <b>Harakat:</b> {html.escape(action_text)}"
@@ -278,6 +564,8 @@ async def handle_business_message(message: Message, bot: Bot):
 
     admin_ids = await db.get_all_admin_ids()
     for admin_id in admin_ids:
+        if admin_id == tracked_user_id:
+            continue
         try:
             if media_type == "photo":
                 caption = safe_format_caption(admin_header, msg_text)
@@ -414,6 +702,7 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
             sender_name = cached.get("sender_username")
             sender_str = f"@{sender_name}" if sender_name else (cached.get("sender_name") or "Noma'lum")
             file_id = cached.get("file_id")
+            local_path = cached.get("local_file_path")
             is_from_user = (cached_sender == tracked_user_id) if tracked_user_id else False
 
             # 1) FOYDALANUVCHIGA YUBORISH (Agar suhbatdoshi o'chirgan bo'lsa yoki view-once media bo'lsa)
@@ -424,28 +713,39 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
                     f"👤 <b>Kimdan:</b> {html.escape(sender_str)}\n"
                     f"💬 <b>Chat:</b> {html.escape(chat_title)}\n\n"
                     f"▫️ <b>O'chirilgan ma'lumot:</b>\n"
-                    f"<code>{html.escape(cached_text[:1500])}</code>"
+                    f"<code>{html.escape(cached_text[:1500])}</code>\n\n"
+                    f"💡 <i>Ushbu xabarga reply qilib har qanday xabar yozsangiz, fayl darhol yuklab beriladi.</i>"
                 )
-                try:
-                    if media_type == "photo" and file_id:
-                        await bot.send_photo(chat_id=tracked_user_id, photo=file_id, caption=safe_format_caption(user_del_msg), parse_mode="HTML")
-                    elif media_type == "video" and file_id:
-                        await bot.send_video(chat_id=tracked_user_id, video=file_id, caption=safe_format_caption(user_del_msg), parse_mode="HTML")
-                    elif media_type == "animation" and file_id:
-                        await bot.send_animation(chat_id=tracked_user_id, animation=file_id, caption=safe_format_caption(user_del_msg), parse_mode="HTML")
-                    elif media_type == "voice" and file_id:
-                        await bot.send_voice(chat_id=tracked_user_id, voice=file_id, caption=safe_format_caption(user_del_msg), parse_mode="HTML")
-                    elif media_type == "video_note" and file_id:
-                        await bot.send_message(chat_id=tracked_user_id, text=user_del_msg[:4096], parse_mode="HTML")
-                        await bot.send_video_note(chat_id=tracked_user_id, video_note=file_id)
-                    else:
-                        await bot.send_message(chat_id=tracked_user_id, text=user_del_msg[:4096], parse_mode="HTML")
-                except Exception as e:
-                    logger.warning(f"Media yetkazib berishda xatolik, matn ko'rinishida yuborildi ({tracked_user_id}): {e}")
-                    try:
-                        await bot.send_message(chat_id=tracked_user_id, text=user_del_msg[:4096], parse_mode="HTML")
-                    except Exception as e2:
-                        logger.error(f"Foydalanuvchiga o'chirilgan xabarni yuborib bo'lmadi: {e2}")
+
+                reply_markup = None
+                if media_type:
+                    reply_markup = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="📥 Faylni yuklab olish", callback_data=f"dl_msg_{cached['id']}")]
+                    ])
+
+                sent_msg = await send_saved_media(
+                    bot=bot,
+                    chat_id=tracked_user_id,
+                    media_type=media_type,
+                    file_id=file_id,
+                    local_file_path=local_path,
+                    caption=user_del_msg,
+                    reply_markup=reply_markup
+                )
+
+                if sent_msg:
+                    await db.save_sent_notification(
+                        bot_message_id=sent_msg.message_id,
+                        user_id=tracked_user_id,
+                        cached_id=cached.get("id"),
+                        original_chat_id=event.chat.id,
+                        original_message_id=msg_id,
+                        media_type=media_type,
+                        file_id=file_id,
+                        local_file_path=local_path,
+                        text=cached_text,
+                        caption=cached.get("caption")
+                    )
 
             # 2) ADMINGA YUBORISH (Faqat chat adminning o'zi bilan bo'lmasa yoki test qilinayotgan bo'lsa)
             if not is_admin_chat or (cached_sender not in admin_ids):
@@ -456,36 +756,45 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
                     f"💬 <b>Chat:</b> {html.escape(chat_title)}\n"
                     f"👤 <b>Kim o'chirdi:</b> {html.escape(sender_str)}"
                 )
+                admin_cap = safe_format_caption(admin_header, f"[O'chirilgan {fallback_media}]\n{cached_text}")
+
+                admin_markup = None
+                if media_type:
+                    admin_markup = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="📥 Faylni yuklab olish", callback_data=f"dl_msg_{cached['id']}")]
+                    ])
 
                 for admin_id in admin_ids:
-                    try:
-                        if media_type == "photo" and file_id:
-                            cap = safe_format_caption(admin_header, f"[O'chirilgan rasm]\n{cached_text}")
-                            await bot.send_photo(chat_id=admin_id, photo=file_id, caption=cap, parse_mode="HTML")
-                        elif media_type == "video" and file_id:
-                            cap = safe_format_caption(admin_header, f"[O'chirilgan video]\n{cached_text}")
-                            await bot.send_video(chat_id=admin_id, video=file_id, caption=cap, parse_mode="HTML")
-                        elif media_type == "animation" and file_id:
-                            cap = safe_format_caption(admin_header, f"[O'chirilgan GIF]\n{cached_text}")
-                            await bot.send_animation(chat_id=admin_id, animation=file_id, caption=cap, parse_mode="HTML")
-                        elif media_type == "voice" and file_id:
-                            cap = safe_format_caption(admin_header, "🎤 O'chirilgan ovozli xabar")
-                            await bot.send_voice(chat_id=admin_id, voice=file_id, caption=cap, parse_mode="HTML")
-                        elif media_type == "video_note" and file_id:
-                            await send_to_admin_safely(bot, admin_id, f"{admin_header}\n⭕️ <b>O'chirilgan dumaloq video:</b>")
-                            await bot.send_video_note(chat_id=admin_id, video_note=file_id)
-                        else:
-                            full_admin_text = (
-                                f"{admin_header}\n\n"
-                                f"▫️ <b>O'chirilgan xabar:</b>\n"
-                                f"<code>{html.escape(cached_text[:1500])}</code>"
-                            )
-                            await send_to_admin_safely(bot, admin_id, full_admin_text)
-                    except Exception as e:
-                        logger.error(f"Error forwarding deleted message to admin {admin_id}: {e}")
+                    # Agar admin o'zi bu chatdagi foydalanuvchi bo'lsa va yuqorida bildirishnoma olgan bo'lsa, qayta yubormaymiz
+                    if admin_id == tracked_user_id and not is_from_user:
+                        continue
 
-            # 3) SERVER XOTIRASINI TEJASH: Xabar Telegramga uzatilgach, keshdan o'chirib tashlaymiz!
-            await db.delete_cached_message(event.chat.id, msg_id)
+                    sent_adm = await send_saved_media(
+                        bot=bot,
+                        chat_id=admin_id,
+                        media_type=media_type,
+                        file_id=file_id,
+                        local_file_path=local_path,
+                        caption=admin_cap,
+                        reply_markup=admin_markup
+                    )
+                    if sent_adm:
+                        await db.save_sent_notification(
+                            bot_message_id=sent_adm.message_id,
+                            user_id=admin_id,
+                            cached_id=cached.get("id"),
+                            original_chat_id=event.chat.id,
+                            original_message_id=msg_id,
+                            media_type=media_type,
+                            file_id=file_id,
+                            local_file_path=local_path,
+                            text=cached_text,
+                            caption=cached.get("caption")
+                        )
+
+            # 3) Xabarni keshdan birdaniga o'chirib yubormaymiz, balki o'chirilgan deb belgilaymiz!
+            # Shunda foydalanuvchi replay qilganda ("replay qilib har qanday xabar yozsa"), fayl keshda turadi va uni yuklab bera oladi.
+            await db.mark_cached_message_deleted(event.chat.id, msg_id)
 
         else:
             # Keshda saqlanmagan xabar o'chirilganda

@@ -23,6 +23,9 @@ if db_path_env:
 else:
     DB_PATH = BASE_DIR / "spy_bot.db"
 
+MEDIA_CACHE_DIR = BASE_DIR / "media_cache"
+MEDIA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 def is_admin(user_id: int) -> bool:

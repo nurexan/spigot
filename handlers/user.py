@@ -1,4 +1,7 @@
-from aiogram import Router, F
+import html
+import os
+from typing import Optional
+from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart
 
@@ -56,6 +59,135 @@ ADMIN_BUTTON_TEXTS = {
     "💳 Faol kodlar",
     "❌ Bekor qilish"
 }
+
+# ==========================================
+# O'chirilgan xabarlarga reply qilib yuklab olish va Callback
+# ==========================================
+
+async def deliver_download_media(
+    bot: Bot,
+    chat_id: int,
+    media_type: Optional[str],
+    file_id: Optional[str],
+    local_file_path: Optional[str],
+    text: Optional[str] = None
+):
+    """
+    O'chirilgan yoki saqlangan xabarni foydalanuvchiga to'liq yuklab berish.
+    Ham ko'rish uchun native media, ham xotiraga/galereyaga saqlash uchun asl fayl (document) formatida beradi.
+    """
+    from handlers.business import send_saved_media
+
+    has_file = bool(local_file_path and os.path.exists(local_file_path)) or bool(file_id)
+
+    if not has_file and not text:
+        await bot.send_message(chat_id, "ℹ️ Ushbu xabar uchun yuklab olishga media ma'lumot topilmadi.", parse_mode="HTML")
+        return
+
+    # Agar oddiy matn bo'lsa
+    if not media_type or media_type == "text":
+        await bot.send_message(
+            chat_id,
+            f"💬 <b>O'chirilgan xabar to'liq matni:</b>\n\n<code>{html.escape(text or '')}</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    caption = f"📥 <b>Yuklab olingan {media_type.upper()}:</b>"
+    if text and text != f"[{media_type.upper()}]":
+        caption += f"\n\n💬 <code>{html.escape(text[:500])}</code>"
+
+    # 1. Ko'rish / eshitish uchun native media formatida yuboramiz
+    await send_saved_media(
+        bot=bot,
+        chat_id=chat_id,
+        media_type=media_type,
+        file_id=file_id,
+        local_file_path=local_file_path,
+        caption=caption
+    )
+
+    # 2. Xotiraga to'liq saqlab olish uchun asl fayl (document) formatida ham yuboramiz
+    if media_type in {"photo", "video", "voice", "video_note"}:
+        await send_saved_media(
+            bot=bot,
+            chat_id=chat_id,
+            media_type=media_type,
+            file_id=file_id,
+            local_file_path=local_file_path,
+            caption=f"📁 <b>{media_type.upper()} fayli (Xotiraga/Galereyaga yuklab olish uchun):</b>",
+            as_document=True
+        )
+
+
+@user_router.message(F.reply_to_message)
+async def handle_user_reply_to_notification(message: Message, bot: Bot):
+    """
+    Foydalanuvchi bot chatida o'chirilgan xabar bildirishnomasiga reply qilib HAR QANDAY xabar yozsa,
+    fayl darhol to'liq yuklab beriladi.
+    """
+    replied = message.reply_to_message
+    if not replied:
+        return
+
+    # Agar bot buyrug'i bo'lsa (masalan /start), o'z navbatiga qo'yamiz
+    if message.text and message.text.startswith("/"):
+        return
+
+    user_id = message.from_user.id if message.from_user else 0
+
+    # 1. sent_notifications jadvalidan qidiramiz
+    notif = await db.get_sent_notification(user_id, replied.message_id)
+    if notif:
+        await deliver_download_media(
+            bot=bot,
+            chat_id=message.chat.id,
+            media_type=notif.get("media_type"),
+            file_id=notif.get("file_id"),
+            local_file_path=notif.get("local_file_path"),
+            text=notif.get("text")
+        )
+        return
+
+    # 2. Agar notification topilmasa, replied.message_id bo'yicha cached_messages dan qidirib ko'ramiz
+    cached = await db.get_cached_message_by_id(replied.message_id)
+    if cached:
+        await deliver_download_media(
+            bot=bot,
+            chat_id=message.chat.id,
+            media_type=cached.get("media_type"),
+            file_id=cached.get("file_id"),
+            local_file_path=cached.get("local_file_path"),
+            text=cached.get("text")
+        )
+        return
+
+
+@user_router.callback_query(F.data.startswith("dl_msg_"))
+async def cb_download_deleted_media(call: CallbackQuery, bot: Bot):
+    """
+    Inline tugma bosilganda faylni to'liq yuklab berish
+    """
+    cached_id_str = call.data.replace("dl_msg_", "")
+    if not cached_id_str.isdigit():
+        await call.answer("Xatolik yuz berdi!", show_alert=True)
+        return
+
+    cached_id = int(cached_id_str)
+    cached = await db.get_cached_message_by_id(cached_id)
+    if not cached:
+        await call.answer("⚠️ Fayl keshdan topilmadi yoki muddati o'tgan.", show_alert=True)
+        return
+
+    await call.answer("📥 Fayl yuklab berilmoqda...")
+    await deliver_download_media(
+        bot=bot,
+        chat_id=call.from_user.id,
+        media_type=cached.get("media_type"),
+        file_id=cached.get("file_id"),
+        local_file_path=cached.get("local_file_path"),
+        text=cached.get("text")
+    )
 
 @user_router.message(F.text.func(lambda text: (
     not text.startswith("/") and

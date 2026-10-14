@@ -1,3 +1,4 @@
+import os
 import aiosqlite
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
@@ -49,6 +50,35 @@ async def init_db():
                 media_type TEXT,
                 file_id TEXT,
                 caption TEXT,
+                local_file_path TEXT,
+                is_deleted INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Migratsiyalar - mavjud bazaga yangi ustunlarni xavfsiz qo'shish
+        try:
+            await db.execute("ALTER TABLE cached_messages ADD COLUMN local_file_path TEXT;")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE cached_messages ADD COLUMN is_deleted INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS sent_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_message_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                cached_id INTEGER,
+                original_chat_id INTEGER,
+                original_message_id INTEGER,
+                media_type TEXT,
+                file_id TEXT,
+                local_file_path TEXT,
+                text TEXT,
+                caption TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -64,6 +94,7 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_cached_msgs ON cached_messages (business_connection_id, chat_id, message_id);")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_users_conn ON users (business_connection_id);")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_codes_active ON codes (is_used, code_type);")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_sent_notif ON sent_notifications (user_id, bot_message_id);")
 
         # Add initial config admins if not already present
         for admin_id in ADMIN_IDS:
@@ -280,21 +311,47 @@ async def save_cached_message(
     text: Optional[str] = None,
     media_type: Optional[str] = None,
     file_id: Optional[str] = None,
-    caption: Optional[str] = None
-):
+    caption: Optional[str] = None,
+    local_file_path: Optional[str] = None
+) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
+        cursor = await db.execute("""
             INSERT INTO cached_messages (
                 business_connection_id, chat_id, message_id,
                 sender_id, sender_name, sender_username,
-                text, media_type, file_id, caption
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                text, media_type, file_id, caption, local_file_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             business_connection_id, chat_id, message_id,
             sender_id, sender_name, sender_username,
-            text, media_type, file_id, caption
+            text, media_type, file_id, caption, local_file_path
         ))
         await db.commit()
+        return cursor.lastrowid
+
+async def update_cached_message_file(chat_id: int, message_id: int, local_file_path: str):
+    """Media yuklab olingach, keshdagi xabar fayl yo'lini yangilash"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                UPDATE cached_messages SET local_file_path = ?
+                WHERE chat_id = ? AND message_id = ?
+            """, (local_file_path, chat_id, message_id))
+            await db.commit()
+    except Exception as e:
+        print(f"Error updating cached message file: {e}")
+
+async def mark_cached_message_deleted(chat_id: int, message_id: int):
+    """Xabar o'chirilganini belgilash (darhol o'chirib yubormasdan, replay qilganda yuklab olish uchun saqlab turamiz)"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                UPDATE cached_messages SET is_deleted = 1
+                WHERE chat_id = ? AND message_id = ?
+            """, (chat_id, message_id))
+            await db.commit()
+    except Exception as e:
+        print(f"Error marking message deleted: {e}")
 
 async def get_cached_message(
     business_connection_id: str,
@@ -324,8 +381,16 @@ async def get_cached_message(
                 return dict(row)
     return None
 
+async def get_cached_message_by_id(cached_id: int) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM cached_messages WHERE id = ?", (cached_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return dict(row)
+    return None
+
 async def delete_cached_message(chat_id: int, message_id: int):
-    """Xabar Telegramga uzatilgandan so'ng server keshidan darhol o'chirish (server xotirasini tejash uchun)"""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
@@ -349,12 +414,85 @@ async def update_cached_message_text(
         """, (new_text, business_connection_id, chat_id, message_id))
         await db.commit()
 
-async def clean_old_messages(hours: int = 24):
-    """24 soatdan oshgan eski xabarlarni tozalash va bazani ixchamlashtirish"""
+# --- Sent Notifications for Reply tracking ---
+
+async def save_sent_notification(
+    bot_message_id: int,
+    user_id: int,
+    cached_id: Optional[int] = None,
+    original_chat_id: Optional[int] = None,
+    original_message_id: Optional[int] = None,
+    media_type: Optional[str] = None,
+    file_id: Optional[str] = None,
+    local_file_path: Optional[str] = None,
+    text: Optional[str] = None,
+    caption: Optional[str] = None
+):
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            threshold = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+            await db.execute("""
+                INSERT INTO sent_notifications (
+                    bot_message_id, user_id, cached_id, original_chat_id,
+                    original_message_id, media_type, file_id, local_file_path,
+                    text, caption
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                bot_message_id, user_id, cached_id, original_chat_id,
+                original_message_id, media_type, file_id, local_file_path,
+                text, caption
+            ))
+            await db.commit()
+    except Exception as e:
+        print(f"Error saving sent notification: {e}")
+
+async def get_sent_notification(user_id: int, bot_message_id: int) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT * FROM sent_notifications
+            WHERE user_id = ? AND bot_message_id = ?
+            ORDER BY id DESC LIMIT 1
+        """, (user_id, bot_message_id)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return dict(row)
+
+        async with db.execute("""
+            SELECT * FROM sent_notifications
+            WHERE bot_message_id = ?
+            ORDER BY id DESC LIMIT 1
+        """, (bot_message_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return dict(row)
+    return None
+
+async def clean_old_messages(hours: int = 24):
+    """24 soatdan oshgan eski xabarlarni va diskdagi kesh fayllarini tozalash"""
+    try:
+        threshold = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            # 1. Diskdagi yuklab olingan fayllarni o'chirish
+            try:
+                async with db.execute(
+                    "SELECT local_file_path FROM cached_messages WHERE created_at < ? AND local_file_path IS NOT NULL",
+                    (threshold,)
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    for r in rows:
+                        p = r["local_file_path"]
+                        if p and os.path.exists(p):
+                            try:
+                                os.remove(p)
+                            except Exception:
+                                pass
+            except Exception as e_file:
+                print(f"Error removing cached files: {e_file}")
+
+            # 2. Bazadagi eski yozuvlarni tozalash
             await db.execute("DELETE FROM cached_messages WHERE created_at < ?", (threshold,))
+            await db.execute("DELETE FROM sent_notifications WHERE created_at < ?", (threshold,))
             await db.commit()
     except Exception as e:
         print(f"Error cleaning old messages: {e}")
