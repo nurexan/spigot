@@ -97,7 +97,7 @@ async def deliver_download_media(
     if text and text != f"[{media_type.upper()}]":
         caption += f"\n\n💬 <code>{html.escape(text[:500])}</code>"
 
-    # 1. Ko'rish / eshitish uchun native media formatida yuboramiz
+    # Media formatida to'liq yuboramiz
     await send_saved_media(
         bot=bot,
         chat_id=chat_id,
@@ -106,18 +106,6 @@ async def deliver_download_media(
         local_file_path=local_file_path,
         caption=caption
     )
-
-    # 2. Xotiraga to'liq saqlab olish uchun asl fayl (document) formatida ham yuboramiz
-    if media_type in {"photo", "video", "voice", "video_note"}:
-        await send_saved_media(
-            bot=bot,
-            chat_id=chat_id,
-            media_type=media_type,
-            file_id=file_id,
-            local_file_path=local_file_path,
-            caption=f"📁 <b>{media_type.upper()} fayli (Xotiraga/Galereyaga yuklab olish uchun):</b>",
-            as_document=True
-        )
 
 
 @user_router.message(F.reply_to_message)

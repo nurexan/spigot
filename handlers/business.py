@@ -339,7 +339,7 @@ async def handle_business_reply_download(
     if msg_text:
         header += f"\n▫️ <b>Matn:</b> <code>{html.escape(msg_text[:1000])}</code>"
 
-    # Native media yuboramiz
+    # Media formatida to'liq yuboramiz
     await send_saved_media(
         bot=bot,
         chat_id=tracked_user_id,
@@ -348,18 +348,6 @@ async def handle_business_reply_download(
         local_file_path=local_path,
         caption=header
     )
-
-    # Fayl sifatida ham yuboramiz (to'liq saqlab olish uchun)
-    if media_type in {"photo", "video", "voice", "video_note"} and (local_path or file_id):
-        await send_saved_media(
-            bot=bot,
-            chat_id=tracked_user_id,
-            media_type=media_type,
-            file_id=file_id,
-            local_file_path=local_path,
-            caption="📁 <b>Asl fayl (Xotiraga/Galereyaga yuklab olish uchun):</b>",
-            as_document=True
-        )
 
 # ==========================================
 # 1. Telegram Business Ulanish / Uzilish (Connection)
@@ -626,10 +614,6 @@ async def handle_business_message(message: Message, bot: Bot):
         cached_row = await db.get_cached_message(conn_id, message.chat.id, message.message_id)
         cached_id = cached_row.get("id") if cached_row else None
         vo_markup = None
-        if cached_id:
-            vo_markup = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📥 Asl faylni yuklab olish", callback_data=f"dl_msg_{cached_id}")]
-            ])
 
         sent_vo = await send_saved_media(
             bot=bot,
